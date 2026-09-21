@@ -1,0 +1,7 @@
+figsize: 800
+naip_dir: /home/jmbillson/Data/USA_Crops/images
+cdl_dir: /home/jmbillson/Data/USA_Crops/cdl
+ae_dir: /home/jmbillson/Data/USA_Crops/alpha_earth
+segment_dir: /home/jmbillson/Data/USA_Crops/sam
+dst_dir: /home/jmbillson/Data/USA_Crops/manual
+sample_id: california_2018_tile_005_patch_238
