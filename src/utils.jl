@@ -28,7 +28,7 @@ function pca(X::AbstractMatrix{<:Real})
     return transformed
 end
 
-function polygonize(mask::Rasters.AbstractRaster{<:Integer,2})
+function polygonize(mask::Rasters.AbstractRaster{<:Integer,2}; tol=10)
     # Get the coordinate ranges for the raster dimensions
     xdim, ydim = Rasters.dims(mask)
     xcoords = first(xdim):Rasters.span(xdim).step:last(xdim)
@@ -42,13 +42,11 @@ function polygonize(mask::Rasters.AbstractRaster{<:Integer,2})
         for component_label in unique_labels(component_mask)
             component_polygon = GeometryOps.polygonize(xcoords, ycoords, component_mask .== component_label).geom
             for p in component_polygon
-                push!(polygons, GeometryOps.simplify(p, tol=2))
-                push!(labels, label)
+                if GeometryOps.area(p) > 500
+                    push!(polygons, GeometryOps.simplify(p; tol))
+                    push!(labels, label)
+                end
             end
-            #@info length(component_polygon)
-            #_, i = findmax(GeometryOps.area.(component_polygon))
-            #push!(polygons, GeoInterface.convert(GeometryBasics, GeometryOps.simplify(component_polygon[i], tol=2)))
-            #push!(labels, label)
         end
     end
 
@@ -75,7 +73,7 @@ function difference(poly1::GeoInterface.Polygon, poly2::GeoInterface.Polygon)
     return GeometryOps.difference(poly1, poly2, target=GeoInterface.PolygonTrait())
 end
 
-function simplify(poly::GeoInterface.Polygon, tol::Real=2)
+function simplify(poly::GeoInterface.Polygon, tol::Real=4)
     return GeometryOps.simplify(poly, tol=tol)
 end
 

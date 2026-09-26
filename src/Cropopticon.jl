@@ -27,8 +27,14 @@ using InvertedIndices: Not
 
 const GLM = GLMakie
 
+const POLYGON_TOL = 2
+
 include("utils.jl")
 include("data_sources.jl")
+
+function __init__()
+    Rasters.checkmem!(false)
+end
 
 struct State{P,D}
     dims::D
@@ -74,8 +80,8 @@ Create a new State object from a raster of segments.
 - `State`: A new State object containing the polygons, labels, and other metadata for the segments.
 """
 function State(segments::Rasters.AbstractRaster{<:Integer,2})
-    polygon_results = polygonize(segments)
-    polygons = isempty(polygon_results) ? Polygon{Tuple{Int,Int}}[] : [Polygon(p, false, false) for p in last.(polygon_results)]
+    polygon_results = polygonize(segments; tol=POLYGON_TOL)
+    polygons = isempty(polygon_results) ? Polygon{GeoInterface.Wrappers.Polygon{false, false, Vector{GeoInterface.Wrappers.LinearRing{false, false, Vector{Tuple{Float64, Float64}}, Nothing, Nothing}}, Nothing, Nothing}}[] : [Polygon(p, false, false) for p in last.(polygon_results)]
     return State(Rasters.dims(segments), polygons, true)
 end
 
@@ -115,7 +121,7 @@ function merge_regions(state::State)
     merged_polys = ImageMorphology.closing(rasterized_polys .> 0x00, r=8) # Merge the regions and fill small holes/gaps between them
 
     # Update the polygons, labels, isfield, and tomerge arrays to reflect the merged regions
-    polygon_results = polygonize(merged_polys)
+    polygon_results = polygonize(merged_polys; tol=POLYGON_TOL)
     polygons = [Polygon(p, false, false) for p in last.(polygon_results)]
 
     return @set state.polygons = vcat(state.polygons[Not(polys_to_merge_indices)], polygons)
@@ -177,7 +183,7 @@ function render_state!(ax, state::GLM.Observable{<:State})
     polygon_colors = GLM.lift(s -> [tomerge(s, l) ? :blue : :red for l in eachindex(s.polygons)], state)
     strokes = GLM.lift((colors, show) -> [(color, show * 0.8) for color in colors], polygon_colors, show_polygons)
     colors = GLM.lift((colors, alphas, show) -> [(c, show * a) for (c, a) in zip(colors, alphas)], polygon_colors, polygon_alphas, show_polygons)
-    polygons = GLM.lift(s -> [GeoInterface.convert(GeometryBasics, p.geom) for p in s.polygons], state)
+    polygons = GLM.lift(s -> isempty(s.polygons) ? GeometryBasics.Polygon[] : [GeoInterface.convert(GeometryBasics, p.geom) for p in s.polygons], state)
     GLM.poly!(ax, polygons, color=colors, strokecolor=strokes, strokewidth=1.0)
 end
 
@@ -319,9 +325,14 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
     GLM.on(savebutton.clicks) do _
         current_state = state[]
         polygons = [getpolygon(current_state, i) for i in eachindex(current_state.polygons) if isfield(current_state, i)]
-        mask = rasterize(polygons, current_state.dims)
-        mask = Rasters.modify(x -> remove_boundary_pixels(x, 2), mask)
-        Rasters.write(joinpath(dst_dir, "$sample_id.tif"), mask, force=true)
+        if !isempty(polygons)
+            mask = rasterize(polygons, current_state.dims)
+            mask = Rasters.modify(x -> remove_boundary_pixels(x, 2), mask)
+            Rasters.write(joinpath(dst_dir, "$sample_id.tif"), mask, force=true)
+        else
+            mask = Rasters.Raster(zeros(UInt8, size(current_state.dims)), current_state.dims)
+            Rasters.write(joinpath(dst_dir, "$sample_id.tif"), mask, force=true)
+        end
     end
 
     axes = [ax1]
@@ -339,8 +350,8 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
 end
 
 function random_unlabelled_sample(mask_dir::String, dst_dir::String)
-    unlabelled_samples = readdir(mask_dir) .|> splitext .|> first
-    labelled_samples = readdir(dst_dir) .|> splitext .|> first
+    unlabelled_samples = @pipe readdir(mask_dir) |> filter(f -> contains(f, r"\.tif$"), _) |> splitext.(_) |> first.(_)
+    labelled_samples = @pipe readdir(dst_dir) |> filter(f -> contains(f, r"\.tif$"), _) |> splitext.(_) |> first.(_)
     candidates = setdiff(unlabelled_samples, labelled_samples)
     @assert !isempty(candidates) "No unlabelled samples found"
     return rand(candidates)
