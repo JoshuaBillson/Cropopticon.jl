@@ -181,6 +181,67 @@ function render_state!(ax, state::GLM.Observable{<:State})
     GLM.poly!(ax, polygons, color=colors, strokecolor=strokes, strokewidth=1.0)
 end
 
+"""
+Pan the given axes by holding Space and moving the mouse (no click needed).
+
+Replaces Makie's default right-drag pan. Because the axes are linked, panning
+whichever axis is under the cursor moves all of them.
+"""
+function enable_space_pan!(fig, axes...)
+    # Remove the default right-click-drag pan from every axis
+    for ax in axes
+        GLM.deregister_interaction!(ax, :dragpan)
+    end
+
+    active = Ref{Any}(nothing)      # axis being panned while Space is held
+    last_pos = Ref((0.0, 0.0))      # last mouse position in window pixels
+
+    # Latch onto the panel currently under the cursor
+    function latch!()
+        idx = findfirst(ax -> GLM.is_mouseinside(ax.scene), axes)
+        active[] = isnothing(idx) ? nothing : axes[idx]
+        last_pos[] = GLM.events(fig).mouseposition[]
+    end
+
+    GLM.on(GLM.events(fig).keyboardbutton) do event
+        if event.key == GLM.Keyboard.space
+            if event.action == GLM.Keyboard.press
+                latch!()
+            elseif event.action == GLM.Keyboard.release
+                active[] = nothing
+            end
+        end
+    end
+
+    GLM.on(GLM.events(fig).mouseposition) do pos
+        # Only pan while Space is held
+        if !GLM.ispressed(fig, GLM.Keyboard.space)
+            active[] = nothing
+            return
+        end
+
+        # Space is down but the cursor wasn't over a panel yet
+        if isnothing(active[])
+            latch!()
+            return
+        end
+        ax = active[]
+
+        # Convert the pixel movement into data units for this axis
+        dx, dy = pos .- last_pos[]
+        last_pos[] = pos
+        lims = ax.finallimits[]
+        viewport = ax.scene.viewport[]
+        xscale = lims.widths[1] / viewport.widths[1]
+        yscale = lims.widths[2] / viewport.widths[2]
+
+        # Content follows the cursor, so the view window moves the opposite way
+        x0 = lims.origin[1] - dx * xscale
+        y0 = lims.origin[2] - dy * yscale
+        GLM.limits!(ax, x0, x0 + lims.widths[1], y0, y0 + lims.widths[2])
+    end
+end
+
 function run_labelling(config::String)
     cfg = YAML.load_file(config)
     sample_id = cfg["sample_id"] == "random" ? random_unlabelled_sample(cfg["segment_dir"], cfg["dst_dir"]) : cfg["sample_id"]
@@ -240,7 +301,7 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
     GLM.on(GLM.events(fig).mousebutton) do event
 
         # Toggle Segment Label on Left Mouse Button Press
-        if event.button == GLM.Mouse.left && event.action == GLM.Mouse.press && GLM.is_mouseinside(ax1.scene)
+        if event.button == GLM.Mouse.left && event.action == GLM.Mouse.press && GLM.is_mouseinside(ax1.scene) && !GLM.ispressed(fig, GLM.Keyboard.space)
 
             # Determine selected segment
             world_pos_x, world_pos_y = GLM.mouseposition(ax1.scene)
@@ -256,9 +317,9 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
         end
 
         if event.button == GLM.Mouse.right && event.action == GLM.Mouse.press && GLM.is_mouseinside(ax1.scene)
-            world_pos_x, world_pos_y = GLM.mouseposition(ax1.scene)
-            if GLM.ispressed(fig, GLM.Keyboard.left_control) # Add polygon
-                poly[] = vcat(points[], [(world_pos_x, world_pos_y)], points[][1:1])
+            if GLM.ispressed(fig, GLM.Keyboard.left_control) && length(points[]) >= 3 # Close polygon
+                verts = [(Float64(p[1]), Float64(p[2])) for p in points[]]
+                poly[] = vcat(verts, verts[1:1])
                 points[] = Tuple{Int,Int}[]
             end
         end
@@ -266,6 +327,35 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
 
     GLM.lines!(ax1, points)
     GLM.poly!(ax1, poly, color=(:blue,0.0), strokecolor=(:blue,1.0), strokewidth=2.0)
+
+    # Live preview, like Serval's "select raster cells by polygon": a rubber-band
+    # line from the last vertex to the cursor, a dashed line back to the first
+    # vertex, and a shaded polygon showing what would be covered if closed now.
+    cursor = GLM.Observable(GeometryBasics.Point2f(0, 0))
+    update_cursor!(_) = (cursor[] = GeometryBasics.Point2f(GLM.mouseposition(ax1.scene)))
+    GLM.on(update_cursor!, GLM.events(fig).mouseposition)
+    GLM.on(update_cursor!, ax1.finallimits)   # stay in sync while panning/zooming
+
+    preview_edge = GLM.lift(points, cursor) do pts, c
+        isempty(pts) ? GeometryBasics.Point2f[] : [GeometryBasics.Point2f(pts[end]...), c]
+    end
+    preview_closing = GLM.lift(points, cursor) do pts, c
+        isempty(pts) ? GeometryBasics.Point2f[] : [c, GeometryBasics.Point2f(pts[1]...)]
+    end
+    preview_fill = GLM.lift(points, cursor) do pts, c
+        if length(pts) < 2
+            GeometryBasics.Point2f[]
+        else
+            verts = GeometryBasics.Point2f[GeometryBasics.Point2f(p...) for p in pts]
+            push!(verts, c)
+            verts
+        end
+    end
+
+    # xautolimits/yautolimits=false so the preview can never change the view
+    GLM.poly!(ax1, preview_fill, color=(:yellow, 0.25), xautolimits=false, yautolimits=false)
+    GLM.lines!(ax1, preview_closing, color=(:yellow, 0.6), linewidth=1.5, linestyle=:dash, xautolimits=false, yautolimits=false)
+    GLM.lines!(ax1, preview_edge, color=:yellow, linewidth=2, xautolimits=false, yautolimits=false)
 
     buttongrid = GLM.GridLayout(fig[3, 1], tellwidth=false)
     showbutton = GLM.Button(buttongrid[1, 1], label="Show/Hide")
@@ -315,13 +405,47 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
         end
     end
 
-    savebutton = GLM.Button(buttongrid[1, 7], label="Save")
-    GLM.on(savebutton.clicks) do _
+    # Write the current field labels to <dst_dir>/<sample_id>.tif
+    function save_labels!()
         current_state = state[]
         polygons = [getpolygon(current_state, i) for i in eachindex(current_state.polygons) if isfield(current_state, i)]
-        mask = rasterize(polygons, current_state.dims)
-        mask = Rasters.modify(x -> remove_boundary_pixels(x, 2), mask)
+        if isempty(polygons)
+            # Nothing marked as field: write an all-zero mask so the sample still counts as done
+            mask = Rasters.Raster(zeros(UInt8, map(length, current_state.dims)), current_state.dims; missingval=0x00)
+        else
+            mask = rasterize(polygons, current_state.dims)
+            mask = Rasters.modify(x -> remove_boundary_pixels(x, 2), mask)
+        end
         Rasters.write(joinpath(dst_dir, "$sample_id.tif"), mask, force=true)
+        @info "Saved $sample_id"
+    end
+
+    savebutton = GLM.Button(buttongrid[1, 7], label="Save")
+    GLM.on(savebutton.clicks) do _
+        save_labels!()
+    end
+
+    # Next: save this sample, then load the next unlabelled one in the same window
+    loading = Ref(false)   # ignore extra clicks while the next sample is loading
+    nextbutton = GLM.Button(buttongrid[1, 8], label="Next")
+    GLM.on(nextbutton.clicks) do _
+        loading[] && return
+        loading[] = true
+        @async try
+            save_labels!()
+            next_id = next_unlabelled_sample(segment_dir, dst_dir)
+            if isnothing(next_id)
+                @info "No unlabelled samples left"
+                loading[] = false
+                return
+            end
+            newfig = run_labelling(naip_dir, cdl_dir, ae_dir, segment_dir, dst_dir, next_id, figsize)
+            screen = GLM.Makie.getscreen(fig.scene)
+            isnothing(screen) ? display(newfig) : display(screen, newfig)
+        catch err
+            loading[] = false
+            @error "Next failed; staying on this sample" exception=(err, catch_backtrace())
+        end
     end
 
     axes = [ax1]
@@ -332,6 +456,7 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
         push!(axes, ax3)
     end
     GLM.linkaxes!(axes...)
+    enable_space_pan!(fig, axes...)
 
     GLM.colsize!(fig.layout, 1, GLM.Relative(2/3))
 
@@ -339,11 +464,18 @@ function run_labelling(naip_dir::String, cdl_dir::String, ae_dir::String, segmen
 end
 
 function random_unlabelled_sample(mask_dir::String, dst_dir::String)
-    unlabelled_samples = readdir(mask_dir) .|> splitext .|> first
-    labelled_samples = readdir(dst_dir) .|> splitext .|> first
-    candidates = setdiff(unlabelled_samples, labelled_samples)
+    tif_stems(dir) = [splitext(f)[1] for f in readdir(dir) if endswith(f, ".tif")]
+    candidates = setdiff(tif_stems(mask_dir), tif_stems(dst_dir))
     @assert !isempty(candidates) "No unlabelled samples found"
     return rand(candidates)
+end
+
+# Like random_unlabelled_sample, but returns `nothing` instead of erroring when
+# every sample has been labelled (used by the Next button).
+function next_unlabelled_sample(mask_dir::String, dst_dir::String)
+    tif_stems(dir) = [splitext(f)[1] for f in readdir(dir) if endswith(f, ".tif")]
+    candidates = setdiff(tif_stems(mask_dir), tif_stems(dst_dir))
+    return isempty(candidates) ? nothing : rand(candidates)
 end
 
 end # module Cropopticon
